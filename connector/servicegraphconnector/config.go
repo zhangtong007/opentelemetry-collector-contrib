@@ -15,7 +15,9 @@ type Config struct {
 
 	// LatencyHistogramBuckets is the list of durations representing latency histogram buckets.
 	// See defaultLatencyHistogramBucketsMs in processor.go for the default value.
-	LatencyHistogramBuckets []time.Duration `mapstructure:"latency_histogram_buckets"`
+	LatencyHistogramBuckets     []time.Duration `mapstructure:"latency_histogram_buckets"`
+	SpanLatencyHistogramBuckets []time.Duration `mapstructure:"span_latency_histogram_buckets"`
+	IsCustomSpanConsume         bool            `mapstructure:"is_custom_span_consume"`
 
 	// Dimensions defines the list of additional dimensions on top of the provided:
 	// - client

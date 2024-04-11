@@ -31,6 +31,9 @@ const (
 	metricKeySeparator = string(byte(0))
 	clientKind         = "client"
 	serverKind         = "server"
+
+	// 表示根节点，父span不存在或找不到父san
+	root = "root"
 )
 
 var (
@@ -39,6 +42,10 @@ var (
 	}
 	defaultLatencyHistogramBuckets = []float64{
 		0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1, 1.4, 2, 5, 10, 15,
+	}
+
+	spanDurationBounds = []float64{
+		1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
 	}
 
 	defaultPeerAttributes = []string{
@@ -74,6 +81,12 @@ type serviceGraphConnector struct {
 	reqServerDurationSecondsSum          map[string]float64
 	reqServerDurationSecondsBucketCounts map[string][]uint64
 	reqDurationBounds                    []float64
+	spanDurationBounds                   []float64
+	spanCount                            map[string]int64
+	spanDurationCount                    map[string]uint64
+	spanDurationSum                      map[string]float64
+	spanDurationBucketCounts             map[string][]uint64
+	isCustomSpanConsume                  bool
 
 	metricMutex sync.RWMutex
 	keyToMetric map[string]metricSeries
@@ -98,6 +111,10 @@ func newConnector(set component.TelemetrySettings, config component.Config) *ser
 	}
 	if pConfig.LatencyHistogramBuckets != nil {
 		bounds = mapDurationsToFloat(pConfig.LatencyHistogramBuckets)
+	}
+
+	if pConfig.SpanLatencyHistogramBuckets != nil {
+		spanDurationBounds = mapDurationsToFloat(pConfig.SpanLatencyHistogramBuckets)
 	}
 
 	if pConfig.CacheLoop <= 0 {
@@ -146,12 +163,18 @@ func newConnector(set component.TelemetrySettings, config component.Config) *ser
 		reqServerDurationSecondsCount:        make(map[string]uint64),
 		reqServerDurationSecondsSum:          make(map[string]float64),
 		reqServerDurationSecondsBucketCounts: make(map[string][]uint64),
+		spanCount:                            make(map[string]int64),
+		spanDurationCount:                    make(map[string]uint64),
+		spanDurationSum:                      make(map[string]float64),
+		spanDurationBucketCounts:             make(map[string][]uint64),
+		spanDurationBounds:                   spanDurationBounds,
 		reqDurationBounds:                    bounds,
 		keyToMetric:                          make(map[string]metricSeries),
 		shutdownCh:                           make(chan any),
 		statDroppedSpans:                     droppedSpan,
 		statTotalEdges:                       totalEdges,
 		statExpiredEdges:                     expiredEdges,
+		isCustomSpanConsume:                  pConfig.IsCustomSpanConsume,
 	}
 }
 
@@ -197,8 +220,14 @@ func (p *serviceGraphConnector) metricFlushLoop(flushInterval time.Duration) {
 	for {
 		select {
 		case <-ticker.C:
-			if err := p.flushMetrics(context.Background()); err != nil {
-				p.logger.Error("failed to flush metrics", zap.Error(err))
+			if p.isCustomSpanConsume {
+				if err := p.spanFlushMetrics(context.Background()); err != nil {
+					p.logger.Error("failed to flush span metrics", zap.Error(err))
+				}
+			} else {
+				if err := p.flushMetrics(context.Background()); err != nil {
+					p.logger.Error("failed to flush metrics", zap.Error(err))
+				}
 			}
 		case <-p.shutdownCh:
 			return
@@ -232,6 +261,11 @@ func (p *serviceGraphConnector) Capabilities() consumer.Capabilities {
 }
 
 func (p *serviceGraphConnector) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
+	// 自定义trace消费逻辑，消费所有的span
+	if p.isCustomSpanConsume {
+		return p.customConsumeTraces(ctx, td)
+	}
+
 	if err := p.aggregateMetrics(ctx, td); err != nil {
 		return fmt.Errorf("failed to aggregate metrics: %w", err)
 	}
@@ -245,6 +279,160 @@ func (p *serviceGraphConnector) ConsumeTraces(ctx context.Context, td ptrace.Tra
 	}
 
 	return nil
+}
+
+func (p *serviceGraphConnector) customConsumeTraces(ctx context.Context, td ptrace.Traces) error {
+	// 消费所有trace
+	if err := p.spanAgregateMetrics(ctx, td); err != nil {
+		return fmt.Errorf("failed to consum traces: %s", err.Error())
+	}
+	// to metrics
+	if p.config.MetricsFlushInterval <= 0 {
+		if err := p.spanFlushMetrics(ctx); err != nil {
+			// Not return error here to avoid impacting traces.
+			p.logger.Error("failed to flush metrics", zap.Error(err))
+		}
+	}
+
+	return nil
+}
+
+func (p *serviceGraphConnector) spanFlushMetrics(ctx context.Context) error {
+	md, err := p.spanBuildMetrics()
+	if err != nil {
+		return fmt.Errorf("failed to build span metrics: %w", err)
+	}
+	// Skip empty metrics.
+	if md.MetricCount() == 0 {
+		return nil
+	}
+	// Firstly, export md to avoid being impacted by downstream trace serviceGraphConnector errors/latency.
+	return p.metricsConsumer.ConsumeMetrics(ctx, md)
+}
+
+func (p *serviceGraphConnector) spanBuildMetrics() (pmetric.Metrics, error) {
+	m := pmetric.NewMetrics()
+	ilm := m.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	ilm.Scope().SetName("span_metrics")
+
+	// Obtain write lock to reset data
+	p.seriesMutex.Lock()
+	defer p.seriesMutex.Unlock()
+
+	if err := p.spanCollectCountMetrics(ilm); err != nil {
+		return m, err
+	}
+
+	if err := p.spanCollectLatencyMetrics(ilm); err != nil {
+		return m, err
+	}
+
+	return m, nil
+}
+
+func (p *serviceGraphConnector) spanCollectLatencyMetrics(ilm pmetric.ScopeMetrics) error {
+	for key := range p.spanDurationCount {
+		mDuration := ilm.Metrics().AppendEmpty()
+		mDuration.SetName("traces_service_graph_request_client_seconds")
+		// TODO: Support other aggregation temporalities
+		mDuration.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+
+		timestamp := pcommon.NewTimestampFromTime(time.Now())
+
+		dpDuration := mDuration.Histogram().DataPoints().AppendEmpty()
+		dpDuration.SetStartTimestamp(pcommon.NewTimestampFromTime(p.startTime))
+		dpDuration.SetTimestamp(timestamp)
+		dpDuration.ExplicitBounds().FromRaw(p.spanDurationBounds)
+		dpDuration.BucketCounts().FromRaw(p.spanDurationBucketCounts[key])
+		dpDuration.SetCount(p.spanDurationCount[key])
+		dpDuration.SetSum(p.spanDurationSum[key])
+
+		// TODO: Support exemplars
+		dimensions, ok := p.dimensionsForSeries(key)
+		if !ok {
+			return fmt.Errorf("failed to find dimensions for key %s", key)
+		}
+
+		dimensions.CopyTo(dpDuration.Attributes())
+	}
+	return nil
+}
+
+func (p *serviceGraphConnector) spanCollectCountMetrics(ilm pmetric.ScopeMetrics) error {
+	for key, c := range p.spanCount {
+		mCount := ilm.Metrics().AppendEmpty()
+		mCount.SetName("span_metrics_span_count")
+		mCount.SetEmptySum().SetIsMonotonic(true)
+		// TODO: Support other aggregation temporalities
+		mCount.Sum().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+
+		dpCalls := mCount.Sum().DataPoints().AppendEmpty()
+		dpCalls.SetStartTimestamp(pcommon.NewTimestampFromTime(p.startTime))
+		dpCalls.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+		dpCalls.SetIntValue(c)
+
+		dimensions, ok := p.dimensionsForSeries(key)
+		if !ok {
+			return fmt.Errorf("failed to find dimensions for key %s", key)
+		}
+
+		dimensions.CopyTo(dpCalls.Attributes())
+	}
+	return nil
+}
+
+func (p *serviceGraphConnector) spanAgregateMetrics(ctx context.Context, td ptrace.Traces) error {
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		rSpans := rss.At(i)
+		scopeSpans := rSpans.ScopeSpans()
+		for j := 0; j < scopeSpans.Len(); j++ {
+			spans := scopeSpans.At(j).Spans()
+			// 先遍历一遍spans，拿到所有spanID->spanName的映射，便于解析parentID对应的spanName
+			spanMapping := make(map[string]string)
+			for k := 0; k < spans.Len(); k++ {
+				span := spans.At(k)
+				spanMapping[span.SpanID().String()] = span.Name()
+			}
+			for k := 0; k < spans.Len(); k++ {
+				span := spans.At(k)
+				name := span.Name()
+				parentName, exist := spanMapping[span.ParentSpanID().String()]
+				if !exist {
+					parentName = root
+				}
+				traceID := span.TraceID().String()
+				dimensions := pcommon.NewMap()
+				dimensions.PutStr("name", name)
+				dimensions.PutStr("parentName", parentName)
+				dimensions.PutStr("traceID", traceID)
+				var metricKeyBuilder strings.Builder
+				metricKeyBuilder.WriteString(name + metricKeySeparator + parentName + metricKeySeparator + traceID)
+				metricKey := metricKeyBuilder.String()
+				p.seriesMutex.Lock()
+				p.updateSeries(metricKey, dimensions)
+				p.spanUpdateCountMetrics(metricKey)
+				duration := float64(time.Duration(span.EndTimestamp() - span.StartTimestamp()).Milliseconds())
+				p.spanUpdateDurationMetrics(metricKey, duration)
+				p.seriesMutex.Unlock()
+			}
+		}
+	}
+	return nil
+}
+
+func (p *serviceGraphConnector) spanUpdateCountMetrics(key string) {
+	p.spanCount[key]++
+}
+
+func (p *serviceGraphConnector) spanUpdateDurationMetrics(key string, spanDuration float64) {
+	index := sort.SearchFloat64s(p.spanDurationBounds, spanDuration)
+	if _, ok := p.spanDurationBucketCounts[key]; !ok {
+		p.spanDurationBucketCounts[key] = make([]uint64, len(p.spanDurationBounds)+1)
+	}
+	p.spanDurationSum[key] += spanDuration
+	p.spanDurationCount[key]++
+	p.spanDurationBucketCounts[key][index]++
 }
 
 func (p *serviceGraphConnector) aggregateMetrics(ctx context.Context, td ptrace.Traces) (err error) {
